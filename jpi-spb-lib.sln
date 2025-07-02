@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.13.35806.99 d17.13
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "jpi-spb-lib", "jpi-spb-lib\jpi-spb-lib.csproj", "{A545CBBC-8101-4D30-AFD9-4B833B8623CE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TestConsoleApp", "TestConsoleApp\TestConsoleApp.csproj", "{6CBB6DF2-0644-4AD6-B9EC-993D6ADD87B4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{A545CBBC-8101-4D30-AFD9-4B833B8623CE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A545CBBC-8101-4D30-AFD9-4B833B8623CE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A545CBBC-8101-4D30-AFD9-4B833B8623CE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A545CBBC-8101-4D30-AFD9-4B833B8623CE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6CBB6DF2-0644-4AD6-B9EC-993D6ADD87B4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6CBB6DF2-0644-4AD6-B9EC-993D6ADD87B4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6CBB6DF2-0644-4AD6-B9EC-993D6ADD87B4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6CBB6DF2-0644-4AD6-B9EC-993D6ADD87B4}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {5EFA69F4-A724-4C88-80AB-14C87CCEA74A}
+	EndGlobalSection
+EndGlobal
