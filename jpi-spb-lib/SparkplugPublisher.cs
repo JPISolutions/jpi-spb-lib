@@ -13,6 +13,7 @@ namespace SparkplugB.Publisher
     {
         private readonly SparkplugConfiguration _config;
         private readonly IManagedMqttClient _mqttClient;
+        private readonly MetricStore _metricStore;
         private ILogger _logger;
         private bool _disposed;
         private ulong _sequenceNumber;
@@ -30,6 +31,7 @@ namespace SparkplugB.Publisher
             }
 
             _mqttClient = new MqttFactory().CreateManagedMqttClient();
+            _metricStore = new MetricStore();
             _logger = Log.Logger; // Default to global logger
             _birthSequence = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _sequenceNumber = 0;
@@ -148,6 +150,9 @@ namespace SparkplugB.Publisher
 
             try
             {
+                // Update the metric store
+                _metricStore.UpdateNodeMetrics(metrics);
+
                 var topic = SparkplugTopics.GetNodeDataTopic(_config.GroupId, _config.EdgeNodeId);
                 var sequence = IncrementSequence();
                 var payload = SparkplugMessageFactory.CreatePayload(metrics, sequence);
@@ -171,6 +176,9 @@ namespace SparkplugB.Publisher
 
             try
             {
+                // Store all device metrics
+                _metricStore.UpdateDeviceMetrics(deviceId, metrics);
+
                 var topic = SparkplugTopics.GetDeviceBirthTopic(_config.GroupId, _config.EdgeNodeId, deviceId);
                 var sequence = IncrementSequence();
                 var payload = SparkplugMessageFactory.CreatePayload(metrics, sequence);
@@ -194,6 +202,9 @@ namespace SparkplugB.Publisher
 
             try
             {
+                // Update the metric store
+                _metricStore.UpdateDeviceMetrics(deviceId, metrics);
+
                 var topic = SparkplugTopics.GetDeviceDataTopic(_config.GroupId, _config.EdgeNodeId, deviceId);
                 var sequence = IncrementSequence();
                 var payload = SparkplugMessageFactory.CreatePayload(metrics, sequence);
@@ -217,6 +228,9 @@ namespace SparkplugB.Publisher
 
             try
             {
+                // Remove device from metric store
+                _metricStore.RemoveDevice(deviceId);
+
                 var topic = SparkplugTopics.GetDeviceDeathTopic(_config.GroupId, _config.EdgeNodeId, deviceId);
                 var sequence = IncrementSequence();
                 var payload = SparkplugMessageFactory.CreateDeviceDeath(sequence);
@@ -233,22 +247,131 @@ namespace SparkplugB.Publisher
             }
         }
 
+        /// <summary>
+        /// Publishes only metrics that have changed since last update
+        /// </summary>
+        public async Task PublishChangedMetricsAsync(CancellationToken cancellationToken = default)
+        {
+            EnsureConnected();
+
+            try
+            {
+                var (nodeMetrics, deviceMetrics) = _metricStore.GetChangedMetrics();
+
+                // Publish changed node metrics
+                if (nodeMetrics.Any())
+                {
+                    await PublishNodeMetricsAsync(nodeMetrics, cancellationToken);
+                }
+
+                // Publish changed device metrics
+                foreach (var kvp in deviceMetrics)
+                {
+                    if (kvp.Value.Any())
+                    {
+                        await PublishDeviceMetricsAsync(kvp.Key, kvp.Value, cancellationToken);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Error publishing changed metrics");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Handles a rebirth request by republishing all births
+        /// </summary>
+        public async Task HandleRebirthAsync(CancellationToken cancellationToken = default)
+        {
+            EnsureConnected();
+
+            try
+            {
+                _logger.Information("Handling rebirth request");
+
+                // Reset sequence number
+                _sequenceNumber = 0;
+
+                // Reset change tracking to ensure all metrics are sent
+                _metricStore.ResetChangeTracking();
+
+                // Publish NBIRTH with all current node metrics
+                await PublishNodeBirthAsync(cancellationToken);
+
+                // Publish DBIRTH for all known devices
+                foreach (var deviceId in _metricStore.GetDeviceIds())
+                {
+                    var metrics = _metricStore.GetDeviceMetrics(deviceId);
+                    if (metrics.Any())
+                    {
+                        var topic = SparkplugTopics.GetDeviceBirthTopic(_config.GroupId, _config.EdgeNodeId, deviceId);
+                        var sequence = IncrementSequence();
+                        var payload = SparkplugMessageFactory.CreatePayload(metrics, sequence);
+
+                        await PublishAsync(topic, payload, cancellationToken);
+
+                        _logger.Information("Re-published DBIRTH for device {DeviceId} with {MetricCount} metrics",
+                            deviceId, metrics.Count());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Error handling rebirth");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Gets the current value of a node metric
+        /// </summary>
+        public Metric? GetNodeMetric(string metricName)
+        {
+            return _metricStore.GetNodeMetric(metricName);
+        }
+
+        /// <summary>
+        /// Gets the current value of a device metric
+        /// </summary>
+        public Metric? GetDeviceMetric(string deviceId, string metricName)
+        {
+            return _metricStore.GetDeviceMetric(deviceId, metricName);
+        }
+
+        /// <summary>
+        /// Gets all current node metrics
+        /// </summary>
+        public IEnumerable<Metric> GetAllNodeMetrics()
+        {
+            return _metricStore.GetNodeMetrics();
+        }
+
+        /// <summary>
+        /// Gets all current device metrics
+        /// </summary>
+        public IEnumerable<Metric> GetAllDeviceMetrics(string deviceId)
+        {
+            return _metricStore.GetDeviceMetrics(deviceId);
+        }
+
         private async Task PublishNodeBirthAsync(CancellationToken cancellationToken)
         {
             try
             {
                 var topic = SparkplugTopics.GetNodeBirthTopic(_config.GroupId, _config.EdgeNodeId);
 
-                // Create initial node metrics if needed
-                var nodeMetrics = new List<Metric>();
-                // Add any additional node-level metrics here if needed
+                // Get all stored node metrics for NBIRTH
+                var nodeMetrics = _metricStore.GetNodeMetrics().ToList();
 
                 // Use the factory method for NBIRTH which includes bdSeq and Node Control/Rebirth
                 var payload = SparkplugMessageFactory.CreateNodeBirth(nodeMetrics, _birthSequence, 0);
 
                 await PublishAsync(topic, payload, cancellationToken);
 
-                _logger.Information("Published NBIRTH with bdSeq {BirthSequence}", _birthSequence);
+                _logger.Information("Published NBIRTH with bdSeq {BirthSequence} and {MetricCount} metrics",
+                    _birthSequence, nodeMetrics.Count);
             }
             catch (Exception ex)
             {
