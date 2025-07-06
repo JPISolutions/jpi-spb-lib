@@ -3,6 +3,9 @@ using MQTTnet.Client;
 using MQTTnet.Extensions.ManagedClient;
 using MQTTnet.Protocol;
 using Serilog;
+using Com.Cirruslink.Sparkplug.Protobuf;
+using MQTTnet.Packets;
+
 
 namespace SparkplugB.Publisher
 {
@@ -17,7 +20,9 @@ namespace SparkplugB.Publisher
         private ILogger _logger;
         private bool _disposed;
         private ulong _sequenceNumber;
-        private readonly ulong _birthSequence;
+        private readonly BdSeqManager _bdSeqManager = new();
+        private ulong _bdSeq = 0;
+
 
         public bool IsConnected => _mqttClient?.IsConnected ?? false;
 
@@ -33,8 +38,9 @@ namespace SparkplugB.Publisher
             _mqttClient = new MqttFactory().CreateManagedMqttClient();
             _metricStore = new MetricStore();
             _logger = Log.Logger; // Default to global logger
-            _birthSequence = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _sequenceNumber = 0;
+            _bdSeq = _bdSeqManager.Load();
+            _logger.Information("Loaded bdSeq from file: {BdSeq}", _bdSeq);
         }
 
         public void SetLogger(ILogger logger)
@@ -71,7 +77,7 @@ namespace SparkplugB.Publisher
 
                 // Set up the will message (NDEATH)
                 var willTopic = SparkplugTopics.GetNodeDeathTopic(_config.GroupId, _config.EdgeNodeId);
-                var willPayload = SparkplugMessageFactory.CreateNodeDeath(_birthSequence);
+                var willPayload = SparkplugMessageFactory.CreateNodeDeath(_bdSeq);
                 clientOptions.WithWillTopic(willTopic)
                            .WithWillPayload(willPayload)
                            .WithWillRetain(false)
@@ -89,6 +95,18 @@ namespace SparkplugB.Publisher
                     _logger.Information("Successfully connected to MQTT broker");
                     // Reset sequence number on reconnect
                     _sequenceNumber = 0;
+
+                    var ncmdTopic = SparkplugTopics.GetNodeCommandTopic(_config.GroupId, _config.EdgeNodeId);
+                    await _mqttClient.SubscribeAsync(new List<MqttTopicFilter>
+                    {
+                        new MqttTopicFilterBuilder()
+                            .WithTopic(ncmdTopic)
+                            .WithAtLeastOnceQoS()
+                            .Build()
+                    });
+
+                    _logger.Information("Subscribed to NCMD topic: {Topic}", ncmdTopic);
+
                     // Publish NBIRTH with all current node metrics, if any
                     // On first run there might not be any metrics yet. 
                     var nodeMetrics = _metricStore.GetNodeMetrics().ToList();
@@ -102,6 +120,33 @@ namespace SparkplugB.Publisher
                 {
                     _logger.Warning("Disconnected from MQTT broker: {Reason}", e.Reason);
                     await Task.CompletedTask;
+                };
+
+                _mqttClient.ApplicationMessageReceivedAsync += async e =>
+                {
+                    var topic = e.ApplicationMessage.Topic;
+                    if (topic == SparkplugTopics.GetNodeCommandTopic(_config.GroupId, _config.EdgeNodeId))
+                    {
+                        _logger.Information("Received NCMD message");
+                        try
+                        {
+                            var payload = Payload.Parser.ParseFrom(e.ApplicationMessage.PayloadSegment);
+                            var rebirthRequested = payload.Metrics.Any(m =>
+                                m.Name == "Node Control/Rebirth" &&
+                                m.Datatype == (uint)MetricDataType.Boolean &&
+                                m.BooleanValue == true);
+
+                            if (rebirthRequested)
+                            {
+                                _logger.Information("Rebirth requested via NCMD");
+                                await HandleRebirthAsync(); // Calls your existing rebirth logic
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Error(ex, "Failed to handle NCMD payload");
+                        }
+                    }
                 };
 
                 // Start the managed client
@@ -380,12 +425,15 @@ namespace SparkplugB.Publisher
                 var topic = SparkplugTopics.GetNodeBirthTopic(_config.GroupId, _config.EdgeNodeId);
 
                 // Use the factory method for NBIRTH which includes bdSeq and Node Control/Rebirth
-                var payload = SparkplugMessageFactory.CreateNodeBirth(metrics, _birthSequence, 0);
+                _bdSeq = _bdSeqManager.IncrementAndSave(_bdSeq); // Increment bdSeq for each NBIRTH
+
+                var payload = SparkplugMessageFactory.CreateNodeBirth(metrics, _bdSeq, 0);
 
                 await PublishAsync(topic, payload, cancellationToken);
 
-                _logger.Information("Published NBIRTH with bdSeq {BirthSequence} and {MetricCount} metrics",
-                    _birthSequence, metrics.Count());
+                _logger.Information("Published NBIRTH with bdSeq {BdSeq} and {MetricCount} metrics",
+                    _bdSeq, metrics.Count());
+
             }
             catch (Exception ex)
             {
