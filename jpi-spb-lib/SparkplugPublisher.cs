@@ -89,8 +89,13 @@ namespace SparkplugB.Publisher
                     _logger.Information("Successfully connected to MQTT broker");
                     // Reset sequence number on reconnect
                     _sequenceNumber = 0;
-                    // Publish NBIRTH
-                    await PublishNodeBirthAsync(cancellationToken);
+                    // Publish NBIRTH with all current node metrics, if any
+                    // On first run there might not be any metrics yet. 
+                    var nodeMetrics = _metricStore.GetNodeMetrics().ToList();
+                    if (nodeMetrics.Any())
+                    {
+                        await PublishNodeBirthAsync(nodeMetrics, cancellationToken);
+                    }
                 };
 
                 _mqttClient.DisconnectedAsync += async e =>
@@ -298,7 +303,11 @@ namespace SparkplugB.Publisher
                 _metricStore.ResetChangeTracking();
 
                 // Publish NBIRTH with all current node metrics
-                await PublishNodeBirthAsync(cancellationToken);
+                var nodeMetrics = _metricStore.GetNodeMetrics().ToList();
+                if (nodeMetrics.Any())
+                {
+                    await PublishNodeBirthAsync(nodeMetrics, cancellationToken);
+                }
 
                 // Publish DBIRTH for all known devices
                 foreach (var deviceId in _metricStore.GetDeviceIds())
@@ -356,22 +365,27 @@ namespace SparkplugB.Publisher
             return _metricStore.GetDeviceMetrics(deviceId);
         }
 
-        private async Task PublishNodeBirthAsync(CancellationToken cancellationToken)
+        public async Task PublishNodeBirthAsync(IEnumerable<Metric> metrics, CancellationToken cancellationToken)
         {
+
+            
+
             try
             {
+                // Update the metric store
+                // Is this redundant and causing a bug? We call GetMetrics and pass the metrics in prior
+                // to calling this... 
+                _metricStore.UpdateNodeMetrics(metrics);
+
                 var topic = SparkplugTopics.GetNodeBirthTopic(_config.GroupId, _config.EdgeNodeId);
 
-                // Get all stored node metrics for NBIRTH
-                var nodeMetrics = _metricStore.GetNodeMetrics().ToList();
-
                 // Use the factory method for NBIRTH which includes bdSeq and Node Control/Rebirth
-                var payload = SparkplugMessageFactory.CreateNodeBirth(nodeMetrics, _birthSequence, 0);
+                var payload = SparkplugMessageFactory.CreateNodeBirth(metrics, _birthSequence, 0);
 
                 await PublishAsync(topic, payload, cancellationToken);
 
                 _logger.Information("Published NBIRTH with bdSeq {BirthSequence} and {MetricCount} metrics",
-                    _birthSequence, nodeMetrics.Count);
+                    _birthSequence, metrics.Count());
             }
             catch (Exception ex)
             {

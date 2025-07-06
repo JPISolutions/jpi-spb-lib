@@ -6,10 +6,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <PackageId>SparkplugB.Publisher</PackageId>
-    <Authors>JPI Solutions</Authors>
+    <PackageId>JPI.SparkplugB.Publisher</PackageId>
+    <Authors>Dustin Symes</Authors>
     <Description>A .NET library for publishing MQTT Sparkplug-B messages</Description>
     <PackageVersion>0.1.0</PackageVersion>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/JPISolutions/jpi-spb-lib</PackageProjectUrl>
+    <Copyright>Copyright (C) 2025 JPI Solutions</Copyright>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
