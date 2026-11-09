@@ -46,6 +46,29 @@
         public int KeepAliveSeconds { get; set; } = 60;
 
         /// <summary>
+        /// File that records the bdSeq of the last MQTT connection, so the sequence continues across
+        /// restarts. A relative path is resolved against the application folder. Null or empty uses
+        /// "sparkplug_bdseq.txt" in the application folder.
+        /// </summary>
+        public string? BdSeqFilePath { get; set; }
+
+        /// <summary>
+        /// Delay before retrying after a failed connection attempt. It doubles on each consecutive
+        /// failure, up to <see cref="ReconnectMaxDelaySeconds"/>.
+        /// </summary>
+        public double ReconnectMinDelaySeconds { get; set; } = 1;
+
+        /// <summary>
+        /// Upper bound for the reconnect back-off.
+        /// </summary>
+        public double ReconnectMaxDelaySeconds { get; set; } = 60;
+
+        /// <summary>
+        /// How long a single connection attempt may take before it is abandoned and retried.
+        /// </summary>
+        public double ConnectTimeoutSeconds { get; set; } = 10;
+
+        /// <summary>
         /// Validates the configuration
         /// </summary>
         public bool Validate(out string? errorMessage)
@@ -73,6 +96,18 @@
             if (MqttPort <= 0 || MqttPort > 65535)
             {
                 errorMessage = "MqttPort must be between 1 and 65535";
+                return false;
+            }
+
+            if (ReconnectMinDelaySeconds <= 0 || ReconnectMaxDelaySeconds < ReconnectMinDelaySeconds)
+            {
+                errorMessage = "ReconnectMinDelaySeconds must be positive and no greater than ReconnectMaxDelaySeconds";
+                return false;
+            }
+
+            if (ConnectTimeoutSeconds <= 0)
+            {
+                errorMessage = "ConnectTimeoutSeconds must be positive";
                 return false;
             }
 

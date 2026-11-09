@@ -78,6 +78,18 @@ namespace SparkplugB.Publisher
         }
 
         /// <summary>
+        /// Throws if any metric cannot be encoded, so a bad value is rejected before it is stored and
+        /// later carried by a birth certificate.
+        /// </summary>
+        public static void Validate(IEnumerable<Metric> metrics)
+        {
+            foreach (var metric in metrics)
+            {
+                ConvertToProtobufMetric(metric);
+            }
+        }
+
+        /// <summary>
         /// Converts our Metric to protobuf Metric.
         /// </summary>
         /// <exception cref="NotSupportedException">The metric's data type is not one this library encodes.</exception>

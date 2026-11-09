@@ -49,6 +49,15 @@
             Value = value;
             Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
+
+        /// <summary>
+        /// A copy, so a stored metric cannot be changed by the caller mutating the object it passed in.
+        /// </summary>
+        internal Metric Clone() => new(Name, Value, DataType)
+        {
+            Timestamp = Timestamp,
+            Properties = Properties is null ? null : new Dictionary<string, string>(Properties)
+        };
     }
 
     /// <summary>
