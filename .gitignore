@@ -416,3 +416,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local copies of the Sparkplug specification PDFs
+docs/spec/
