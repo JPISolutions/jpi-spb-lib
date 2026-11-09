@@ -1,4 +1,5 @@
-﻿using Com.Cirruslink.Sparkplug.Protobuf;
+﻿using System.Globalization;
+using Com.Cirruslink.Sparkplug.Protobuf;
 using Google.Protobuf;
 
 namespace SparkplugB.Publisher
@@ -77,10 +78,18 @@ namespace SparkplugB.Publisher
         }
 
         /// <summary>
-        /// Converts our Metric to protobuf Metric
+        /// Converts our Metric to protobuf Metric.
         /// </summary>
+        /// <exception cref="NotSupportedException">The metric's data type is not one this library encodes.</exception>
+        /// <exception cref="ArgumentException">The value cannot be represented as the metric's data type.</exception>
         private static Payload.Types.Metric ConvertToProtobufMetric(Metric metric)
         {
+            if (!IsSupported(metric.DataType))
+            {
+                throw new NotSupportedException(
+                    $"Metric '{metric.Name}': data type {metric.DataType} is not supported by this library.");
+            }
+
             var protoMetric = new Payload.Types.Metric
             {
                 Name = metric.Name,
@@ -88,72 +97,24 @@ namespace SparkplugB.Publisher
                 Datatype = (uint)metric.DataType
             };
 
-            // Set the value based on data type
-            switch (metric.DataType)
+            if (metric.Value == null)
             {
-                case MetricDataType.Int8:
-                case MetricDataType.Int16:
-                case MetricDataType.Int32:
-                case MetricDataType.UInt8:
-                case MetricDataType.UInt16:
-                    if (metric.Value != null)
-                        protoMetric.IntValue = Convert.ToUInt32(metric.Value);
-                    break;
-
-                case MetricDataType.UInt32:
-                    if (metric.Value != null)
-                        protoMetric.IntValue = (uint)metric.Value;
-                    break;
-
-                case MetricDataType.Int64:
-                    if (metric.Value != null)
-                        protoMetric.LongValue = Convert.ToUInt64(metric.Value);
-                    break;
-
-                case MetricDataType.UInt64:
-                    if (metric.Value != null)
-                        protoMetric.LongValue = (ulong)metric.Value;
-                    break;
-
-                case MetricDataType.Float:
-                    if (metric.Value != null)
-                        protoMetric.FloatValue = Convert.ToSingle(metric.Value);
-                    break;
-
-                case MetricDataType.Double:
-                    if (metric.Value != null)
-                        protoMetric.DoubleValue = Convert.ToDouble(metric.Value);
-                    break;
-
-                case MetricDataType.Boolean:
-                    if (metric.Value != null)
-                        protoMetric.BooleanValue = Convert.ToBoolean(metric.Value);
-                    break;
-
-                case MetricDataType.String:
-                case MetricDataType.Text:
-                case MetricDataType.UUID:
-                    protoMetric.StringValue = metric.Value?.ToString() ?? string.Empty;
-                    break;
-
-                case MetricDataType.DateTime:
-                    if (metric.Value is DateTime dt)
-                        protoMetric.LongValue = (ulong)new DateTimeOffset(dt).ToUnixTimeMilliseconds();
-                    else if (metric.Value is DateTimeOffset dto)
-                        protoMetric.LongValue = (ulong)dto.ToUnixTimeMilliseconds();
-                    else if (metric.Value != null)
-                        protoMetric.LongValue = Convert.ToUInt64(metric.Value);
-                    break;
-
-                case MetricDataType.Bytes:
-                case MetricDataType.File:
-                    if (metric.Value is byte[] bytes)
-                        protoMetric.BytesValue = ByteString.CopyFrom(bytes);
-                    break;
-
-                default:
-                    protoMetric.IsNull = true;
-                    break;
+                // A null value is sent as is_null with no value set
+                // (tck-id-operational-behavior-data-publish-nbirth-values / -dbirth-values).
+                protoMetric.IsNull = true;
+            }
+            else
+            {
+                try
+                {
+                    SetValue(protoMetric, metric.DataType, metric.Value);
+                }
+                catch (Exception ex) when (ex is FormatException or InvalidCastException or OverflowException)
+                {
+                    throw new ArgumentException(
+                        $"Metric '{metric.Name}': value '{metric.Value}' ({metric.Value.GetType().Name}) " +
+                        $"cannot be encoded as {metric.DataType}: {ex.Message}", ex);
+                }
             }
 
             // Add properties if any
@@ -179,5 +140,115 @@ namespace SparkplugB.Publisher
 
             return protoMetric;
         }
+
+        private static readonly IFormatProvider Invariant = CultureInfo.InvariantCulture;
+
+        private static bool IsSupported(MetricDataType type) => type switch
+        {
+            MetricDataType.Int8 or MetricDataType.Int16 or MetricDataType.Int32 or MetricDataType.Int64 or
+            MetricDataType.UInt8 or MetricDataType.UInt16 or MetricDataType.UInt32 or MetricDataType.UInt64 or
+            MetricDataType.Float or MetricDataType.Double or MetricDataType.Boolean or
+            MetricDataType.String or MetricDataType.Text or MetricDataType.UUID or
+            MetricDataType.DateTime or MetricDataType.Bytes or MetricDataType.File => true,
+            _ => false
+        };
+
+        /// <summary>
+        /// Writes a non-null value into the protobuf field the Sparkplug spec assigns to its data type.
+        /// Any convertible CLR type is accepted; the declared data type decides the encoding, and a value
+        /// that does not fit it throws (FormatException, InvalidCastException or OverflowException).
+        /// Conversions use the invariant culture so a machine's regional settings cannot change a value.
+        /// </summary>
+        private static void SetValue(Payload.Types.Metric m, MetricDataType type, object value)
+        {
+            switch (type)
+            {
+                // Signed types travel in unsigned protobuf fields (uint32 / uint64) as their two's-complement
+                // bits, sign-extended to the field width, as Eclipse Tahu does. Converting through the signed
+                // type of the declared width first also rejects values that do not fit that width.
+                case MetricDataType.Int8:
+                    m.IntValue = unchecked((uint)Convert.ToSByte(value, Invariant));
+                    break;
+                case MetricDataType.Int16:
+                    m.IntValue = unchecked((uint)Convert.ToInt16(value, Invariant));
+                    break;
+                case MetricDataType.Int32:
+                    m.IntValue = unchecked((uint)Convert.ToInt32(value, Invariant));
+                    break;
+                case MetricDataType.Int64:
+                    m.LongValue = unchecked((ulong)Convert.ToInt64(value, Invariant));
+                    break;
+
+                case MetricDataType.UInt8:
+                    m.IntValue = Convert.ToByte(value, Invariant);
+                    break;
+                case MetricDataType.UInt16:
+                    m.IntValue = Convert.ToUInt16(value, Invariant);
+                    break;
+                case MetricDataType.UInt32:
+                    m.IntValue = Convert.ToUInt32(value, Invariant);
+                    break;
+                case MetricDataType.UInt64:
+                    m.LongValue = Convert.ToUInt64(value, Invariant);
+                    break;
+
+                case MetricDataType.Float:
+                    m.FloatValue = Convert.ToSingle(value, Invariant);
+                    break;
+                case MetricDataType.Double:
+                    m.DoubleValue = Convert.ToDouble(value, Invariant);
+                    break;
+                case MetricDataType.Boolean:
+                    m.BooleanValue = ToBoolean(value);
+                    break;
+
+                case MetricDataType.String:
+                case MetricDataType.Text:
+                case MetricDataType.UUID:
+                    m.StringValue = Convert.ToString(value, Invariant) ?? string.Empty;
+                    break;
+
+                case MetricDataType.DateTime:
+                    m.LongValue = ToEpochMilliseconds(value);
+                    break;
+
+                case MetricDataType.Bytes:
+                case MetricDataType.File:
+                    m.BytesValue = value is byte[] bytes
+                        ? ByteString.CopyFrom(bytes)
+                        : throw new InvalidCastException($"expected byte[], got {value.GetType().Name}");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// A bool, a bool string ("true"/"False"), or a number (any non-zero value is true, which covers
+        /// SCADA digitals that arrive as 0/1, including as numeric strings).
+        /// </summary>
+        private static bool ToBoolean(object value)
+        {
+            switch (value)
+            {
+                case bool b:
+                    return b;
+                case string s:
+                    if (bool.TryParse(s, out var parsed)) return parsed;
+                    if (double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var number)) return number != 0d;
+                    throw new FormatException($"'{s}' is not a Boolean or a number");
+                default:
+                    return Convert.ToDouble(value, Invariant) != 0d;
+            }
+        }
+
+        /// <summary>
+        /// Sparkplug DateTime is unsigned milliseconds since the Unix epoch, so an instant before 1970
+        /// cannot be represented and throws rather than wrapping to a huge value.
+        /// </summary>
+        private static ulong ToEpochMilliseconds(object value) => value switch
+        {
+            DateTimeOffset dto => checked((ulong)dto.ToUnixTimeMilliseconds()),
+            DateTime dt => checked((ulong)new DateTimeOffset(dt).ToUnixTimeMilliseconds()),
+            _ => Convert.ToUInt64(value, Invariant)
+        };
     }
 }

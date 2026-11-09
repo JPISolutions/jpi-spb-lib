@@ -34,5 +34,9 @@
     <Protobuf Include="Protos\sparkplug_b.proto" GrpcServices="None" ProtoComplile="True" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="jpi-spb-lib.Tests" />
+  </ItemGroup>
+
 
 </Project>
