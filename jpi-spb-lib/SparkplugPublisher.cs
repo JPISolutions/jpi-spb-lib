@@ -21,7 +21,18 @@ namespace SparkplugB.Publisher
         private bool _disposed;
         private ulong _sequenceNumber;
         private readonly BdSeqManager _bdSeqManager = new();
+
+        // bdSeq of the current MQTT connection. The will (NDEATH) registered at CONNECT, every NBIRTH
+        // (including rebirths) and the explicit NDEATH sent on a clean stop must all carry this same
+        // value, or the host application ignores the death. It changes only when a new connection is made.
         private ulong _bdSeq = 0;
+
+        // The options object the managed client reuses on every reconnect, kept so the will payload
+        // can be updated with the next connection's bdSeq.
+        private MqttClientOptions? _clientOptions;
+        private volatile bool _stopping;
+
+        private static readonly TimeSpan NodeDeathTimeout = TimeSpan.FromSeconds(5);
 
 
         public bool IsConnected => _mqttClient?.IsConnected ?? false;
@@ -75,7 +86,12 @@ namespace SparkplugB.Publisher
                     clientOptions.WithTlsOptions(o => o.WithSslProtocols(System.Security.Authentication.SslProtocols.Tls12));
                 }
 
-                // Set up the will message (NDEATH)
+                // New connection, new bdSeq. Persist it so a restart continues the sequence.
+                _stopping = false;
+                _bdSeq = _bdSeqManager.IncrementAndSave(_bdSeq);
+
+                // Set up the will message (NDEATH). The broker publishes it only if the connection
+                // drops uncleanly; a clean stop publishes the NDEATH explicitly in DisconnectAsync.
                 var willTopic = SparkplugTopics.GetNodeDeathTopic(_config.GroupId, _config.EdgeNodeId);
                 var willPayload = SparkplugMessageFactory.CreateNodeDeath(_bdSeq);
                 clientOptions.WithWillTopic(willTopic)
@@ -83,10 +99,12 @@ namespace SparkplugB.Publisher
                            .WithWillRetain(false)
                            .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce);
 
+                _clientOptions = clientOptions.Build();
+
                 // Create managed client options
                 var managedOptions = new ManagedMqttClientOptionsBuilder()
                     .WithAutoReconnectDelay(TimeSpan.FromSeconds(_config.KeepAliveSeconds))
-                    .WithClientOptions(clientOptions.Build())
+                    .WithClientOptions(_clientOptions)
                     .Build();
 
                 // Subscribe to connection events
@@ -119,6 +137,16 @@ namespace SparkplugB.Publisher
                 _mqttClient.DisconnectedAsync += async e =>
                 {
                     _logger.Warning("Disconnected from MQTT broker: {Reason}", e.Reason);
+
+                    // A live session ended without us stopping, so the managed client will reconnect.
+                    // Give that connection a new bdSeq (will and NBIRTH alike) so the host can tell
+                    // the old session's will, which the broker may publish late, from the new session.
+                    if (e.ClientWasConnected && !_stopping && _clientOptions != null)
+                    {
+                        _bdSeq = _bdSeqManager.IncrementAndSave(_bdSeq);
+                        _clientOptions.WillPayload = SparkplugMessageFactory.CreateNodeDeath(_bdSeq);
+                    }
+
                     await Task.CompletedTask;
                 };
 
@@ -177,13 +205,20 @@ namespace SparkplugB.Publisher
         {
             try
             {
+                _stopping = true;
+
                 if (_mqttClient.IsConnected)
                 {
                     _logger.Information("Disconnecting from MQTT broker");
 
-                    // The NDEATH will be sent automatically due to the will message
-                    await _mqttClient.StopAsync();
+                    // A clean MQTT DISCONNECT makes the broker discard the will, so the NDEATH has to be
+                    // published explicitly or the host keeps the node online.
+                    await PublishNodeDeathAsync(cancellationToken);
+                }
 
+                if (_mqttClient.IsStarted)
+                {
+                    await _mqttClient.StopAsync();
                     _logger.Information("Disconnected from MQTT broker");
                 }
             }
@@ -424,9 +459,9 @@ namespace SparkplugB.Publisher
 
                 var topic = SparkplugTopics.GetNodeBirthTopic(_config.GroupId, _config.EdgeNodeId);
 
-                // Use the factory method for NBIRTH which includes bdSeq and Node Control/Rebirth
-                _bdSeq = _bdSeqManager.IncrementAndSave(_bdSeq); // Increment bdSeq for each NBIRTH
-
+                // Use the factory method for NBIRTH which includes bdSeq and Node Control/Rebirth.
+                // bdSeq is the current connection's value (it must match the will), so a rebirth on
+                // the same connection reuses it rather than incrementing.
                 var payload = SparkplugMessageFactory.CreateNodeBirth(metrics, _bdSeq, 0);
 
                 await PublishAsync(topic, payload, cancellationToken);
@@ -439,6 +474,42 @@ namespace SparkplugB.Publisher
             {
                 _logger.Error(ex, "Error publishing NBIRTH");
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Publishes NDEATH with the current connection's bdSeq and waits for the broker to acknowledge it.
+        /// Bounded by <see cref="NodeDeathTimeout"/> so a dead broker cannot stall service shutdown.
+        /// </summary>
+        private async Task PublishNodeDeathAsync(CancellationToken cancellationToken)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(NodeDeathTimeout);
+
+            try
+            {
+                // Let already-queued DDATA/NDATA go out first so nothing follows the NDEATH.
+                while (_mqttClient.PendingApplicationMessagesCount > 0 && _mqttClient.IsConnected)
+                {
+                    await Task.Delay(50, timeout.Token);
+                }
+
+                var message = new MqttApplicationMessageBuilder()
+                    .WithTopic(SparkplugTopics.GetNodeDeathTopic(_config.GroupId, _config.EdgeNodeId))
+                    .WithPayload(SparkplugMessageFactory.CreateNodeDeath(_bdSeq))
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                    .WithRetainFlag(false)
+                    .Build();
+
+                // Publish on the underlying client, not the managed queue, so it is sent (and PUBACKed)
+                // before StopAsync sends the DISCONNECT.
+                await _mqttClient.InternalClient.PublishAsync(message, timeout.Token);
+
+                _logger.Information("Published NDEATH with bdSeq {BdSeq}", _bdSeq);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning(ex, "Failed to publish NDEATH with bdSeq {BdSeq}; the host may show the node online until it times out", _bdSeq);
             }
         }
 

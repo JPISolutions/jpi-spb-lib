@@ -9,7 +9,9 @@ namespace SparkplugB.Publisher
 
         public BdSeqManager(string filePath = "sparkplug_bdseq.txt")
         {
-            _filePath = filePath;
+            // Resolve a relative name against the executable's folder, not the current directory:
+            // a Windows service starts in C:\Windows\System32.
+            _filePath = Path.IsPathRooted(filePath) ? filePath : Path.Combine(AppContext.BaseDirectory, filePath);
         }
 
         public ulong Load()
