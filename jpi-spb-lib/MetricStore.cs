@@ -18,13 +18,32 @@ namespace SparkplugB.Publisher
         {
             if (metric == null) throw new ArgumentNullException(nameof(metric));
 
-            _nodeMetrics.AddOrUpdate(metric.Name,
-                metric,
-                (key, existing) =>
-                {
-                    existing.UpdateValue(metric.Value);
-                    return existing;
-                });
+            _nodeMetrics.AddOrUpdate(metric.Name, _ => metric.Clone(), (_, existing) => Merge(existing, metric));
+        }
+
+        /// <summary>
+        /// Replaces the node's metric set, as an NBIRTH declares it.
+        /// </summary>
+        public void ReplaceNodeMetrics(IEnumerable<Metric> metrics)
+        {
+            _nodeMetrics.Clear();
+            UpdateNodeMetrics(metrics);
+        }
+
+        /// <summary>
+        /// Takes the incoming value and timestamp. A change of data type replaces the stored metric, since
+        /// the type is part of what the birth certificate declares.
+        /// </summary>
+        private static Metric Merge(Metric existing, Metric incoming)
+        {
+            if (existing.DataType != incoming.DataType)
+            {
+                return incoming.Clone();
+            }
+
+            existing.Value = incoming.Value;
+            existing.Timestamp = incoming.Timestamp;
+            return existing;
         }
 
         /// <summary>
@@ -50,13 +69,19 @@ namespace SparkplugB.Publisher
 
             var deviceDict = _deviceMetrics.GetOrAdd(deviceId, _ => new ConcurrentDictionary<string, Metric>());
 
-            deviceDict.AddOrUpdate(metric.Name,
-                metric,
-                (key, existing) =>
-                {
-                    existing.UpdateValue(metric.Value);
-                    return existing;
-                });
+            deviceDict.AddOrUpdate(metric.Name, _ => metric.Clone(), (_, existing) => Merge(existing, metric));
+        }
+
+        /// <summary>
+        /// Replaces a device's metric set, as a DBIRTH declares it.
+        /// </summary>
+        public void ReplaceDeviceMetrics(string deviceId, IEnumerable<Metric> metrics)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId))
+                throw new ArgumentException("Device ID cannot be null or empty", nameof(deviceId));
+
+            _deviceMetrics[deviceId] = new ConcurrentDictionary<string, Metric>();
+            UpdateDeviceMetrics(deviceId, metrics);
         }
 
         /// <summary>
