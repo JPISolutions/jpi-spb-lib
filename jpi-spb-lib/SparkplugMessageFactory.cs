@@ -109,6 +109,11 @@ namespace SparkplugB.Publisher
                 Datatype = (uint)metric.DataType
             };
 
+            if (metric.IsHistorical)
+            {
+                protoMetric.IsHistorical = true;
+            }
+
             if (metric.Value == null)
             {
                 // A null value is sent as is_null with no value set

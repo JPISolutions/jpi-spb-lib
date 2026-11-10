@@ -22,6 +22,8 @@ public sealed record HostMessage(int Index, string Topic, string Kind, string? D
 
     public Payload.Types.Metric Metric(string name) => Payload.Metrics.Single(m => m.Name == name);
 
+    public IReadOnlyList<Payload.Types.Metric> HistoricalMetrics => Payload.Metrics.Where(m => m.IsHistorical).ToList();
+
     public override string ToString() =>
         $"#{Index} {Kind}{(DeviceId is null ? "" : "/" + DeviceId)} seq={Seq?.ToString() ?? "-"} " +
         $"bdSeq={BdSeq?.ToString() ?? "-"} qos={(int)Qos} [{string.Join(", ", MetricNames)}]";

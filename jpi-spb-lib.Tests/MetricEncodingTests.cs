@@ -215,6 +215,19 @@ public class MetricEncodingTests
         Assert.Throws<NotSupportedException>(() => Encode(type, 1));
     }
 
+    // ---- is_historical -------------------------------------------------------------------------
+
+    [Fact]
+    public void IsHistorical_IsEncoded_OnlyWhenSet()
+    {
+        var historical = new Metric("m", 1.0, MetricDataType.Double) { IsHistorical = true };
+        var bytes = SparkplugMessageFactory.CreatePayload(new[] { historical, new Metric("n", 2.0, MetricDataType.Double) }, 0);
+        var metrics = Payload.Parser.ParseFrom(bytes).Metrics;
+
+        Assert.True(metrics[0].IsHistorical);
+        Assert.False(metrics[1].HasIsHistorical);
+    }
+
     // ---- Birth and death certificates ------------------------------------------------------
 
     [Fact]
