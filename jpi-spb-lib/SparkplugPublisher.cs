@@ -39,6 +39,11 @@ namespace SparkplugB.Publisher
     public class SparkplugPublisher : ISparkplugPublisher
     {
         private const string RebirthMetricName = "Node Control/Rebirth";
+
+        // Hosts reject a whole payload when one metric in it is bad (seen with Ignition MQTT Engine), so a
+        // backfill is split into messages of at most this many metrics.
+        private const int BackfillMaxMetricsPerMessage = 500;
+
         private static readonly TimeSpan NodeDeathTimeout = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(10);
 
@@ -59,6 +64,10 @@ namespace SparkplugB.Publisher
         private volatile bool _sessionBirthed; // the current connection has completed a birth sequence
         private readonly Dictionary<string, MetricDataType> _declaredNodeMetrics = new();
         private readonly Dictionary<string, Dictionary<string, MetricDataType>> _declaredDeviceMetrics = new();
+
+        // ---- History backfill (null when disabled), guarded by _publishLock ----
+        private readonly BackfillBuffer? _backfill;
+        private bool _backfillOverflowLogged; // re-armed once a reconnect has emptied the buffer
 
         // ---- Connection supervision ----
         private readonly object _lifecycleLock = new();
@@ -85,6 +94,13 @@ namespace SparkplugB.Publisher
             _lastBdSeq = _bdSeqManager.LoadLast();
             _logger.Information("bdSeq state {Path}: last connection used {BdSeq}",
                 _bdSeqManager.FilePath, _lastBdSeq?.ToString() ?? "none");
+
+            if (_config.BackfillEnabled)
+            {
+                _backfill = new BackfillBuffer(_config.BackfillMaxSamples);
+                _logger.Information("History backfill enabled: up to {MaxSamples} samples are kept while disconnected",
+                    _config.BackfillMaxSamples);
+            }
 
             _client = new MqttFactory().CreateMqttClient();
             _client.DisconnectedAsync += OnDisconnectedAsync;
@@ -352,20 +368,24 @@ namespace SparkplugB.Publisher
             await RunUnderLockAsync(async () =>
             {
                 _metricStore.UpdateNodeMetrics(list);
-                if (!SessionIsLive) return;
+                if (!SessionIsLive)
+                {
+                    BufferForBackfill(null, list);
+                    return;
+                }
 
+                var carriedByBirth = false;
                 if (!AllDeclared(_declaredNodeMetrics, list))
                 {
                     _logger.Information("Node metric(s) {Names} not declared in the NBIRTH; publishing a new birth sequence",
                         Undeclared(_declaredNodeMetrics, list));
                     await PublishBirthSequenceUnderLockAsync(cancellationToken).ConfigureAwait(false);
-                    return;
+                    carriedByBirth = true;
                 }
 
-                var sequence = NextSeq();
-                await PublishUnderLockAsync(SparkplugTopics.GetNodeDataTopic(_config.GroupId, _config.EdgeNodeId),
-                    SparkplugMessageFactory.CreatePayload(list, sequence), cancellationToken).ConfigureAwait(false);
-                _logger.Debug("Published NDATA with {MetricCount} metrics, sequence {Sequence}", list.Count, sequence);
+                // A birth carries current values only; historical samples still go out as data.
+                await PublishDataUnderLockAsync(null, carriedByBirth ? list.Where(m => m.IsHistorical).ToList() : list,
+                    cancellationToken).ConfigureAwait(false);
             }, cancellationToken).ConfigureAwait(false);
         }
 
@@ -383,6 +403,10 @@ namespace SparkplugB.Publisher
                 if (SessionIsLive)
                 {
                     await PublishBirthSequenceUnderLockAsync(cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    BufferForBackfill(null, list);
                 }
             }, cancellationToken).ConfigureAwait(false);
         }
@@ -402,6 +426,10 @@ namespace SparkplugB.Publisher
                 {
                     await PublishDeviceBirthUnderLockAsync(deviceId, cancellationToken).ConfigureAwait(false);
                 }
+                else
+                {
+                    BufferForBackfill(deviceId, list);
+                }
             }, cancellationToken).ConfigureAwait(false);
         }
 
@@ -414,28 +442,30 @@ namespace SparkplugB.Publisher
             await RunUnderLockAsync(async () =>
             {
                 _metricStore.UpdateDeviceMetrics(deviceId, list);
-                if (!SessionIsLive) return;
+                if (!SessionIsLive)
+                {
+                    BufferForBackfill(deviceId, list);
+                    return;
+                }
 
+                var carriedByBirth = false;
                 if (!_declaredDeviceMetrics.TryGetValue(deviceId, out var declared))
                 {
                     _logger.Information("Device {DeviceId} has not been birthed on this connection; publishing its DBIRTH", deviceId);
                     await PublishDeviceBirthUnderLockAsync(deviceId, cancellationToken).ConfigureAwait(false);
-                    return;
+                    carriedByBirth = true;
                 }
-
-                if (!AllDeclared(declared, list))
+                else if (!AllDeclared(declared, list))
                 {
                     _logger.Information("Metric(s) {Names} not declared in the DBIRTH for {DeviceId}; publishing a new birth sequence",
                         Undeclared(declared, list), deviceId);
                     await PublishBirthSequenceUnderLockAsync(cancellationToken).ConfigureAwait(false);
-                    return;
+                    carriedByBirth = true;
                 }
 
-                var sequence = NextSeq();
-                await PublishUnderLockAsync(SparkplugTopics.GetDeviceDataTopic(_config.GroupId, _config.EdgeNodeId, deviceId),
-                    SparkplugMessageFactory.CreatePayload(list, sequence), cancellationToken).ConfigureAwait(false);
-                _logger.Debug("Published DDATA for device {DeviceId} with {MetricCount} metrics, sequence {Sequence}",
-                    deviceId, list.Count, sequence);
+                // A birth carries current values only; historical samples still go out as data.
+                await PublishDataUnderLockAsync(deviceId, carriedByBirth ? list.Where(m => m.IsHistorical).ToList() : list,
+                    cancellationToken).ConfigureAwait(false);
             }, cancellationToken).ConfigureAwait(false);
         }
 
@@ -553,7 +583,7 @@ namespace SparkplugB.Publisher
             {
                 await operation().ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is MqttCommunicationException or ObjectDisposedException)
+            catch (Exception ex) when (IsConnectionLoss(ex))
             {
                 _logger.Debug("Publish interrupted by the connection dropping: {Reason}", ex.Message);
                 _sessionBirthed = false;
@@ -595,6 +625,9 @@ namespace SparkplugB.Publisher
                 await PublishDeviceBirthUnderLockAsync(deviceId, cancellationToken).ConfigureAwait(false);
             }
 
+            // History from the outage goes out after the births and before any live data.
+            await PublishBackfillUnderLockAsync(cancellationToken).ConfigureAwait(false);
+
             _sessionBirthed = true;
         }
 
@@ -609,6 +642,137 @@ namespace SparkplugB.Publisher
             _logger.Information("Published DBIRTH for device {DeviceId} with {MetricCount} metrics, sequence {Sequence}",
                 deviceId, metrics.Count, sequence);
         }
+
+        /// <summary>
+        /// NDATA (deviceId null) or DDATA carrying the given metrics. Only metrics declared in the current
+        /// birth can be sent; that excludes only a historical sample whose data type differs from the
+        /// stored metric's, which is dropped with a warning. If the connection drops, the samples go to the
+        /// backfill buffer (when enabled) before the error propagates.
+        /// </summary>
+        private async Task PublishDataUnderLockAsync(string? deviceId, List<Metric> metrics, CancellationToken cancellationToken)
+        {
+            var declared = deviceId is null ? _declaredNodeMetrics : _declaredDeviceMetrics[deviceId];
+            var sendable = metrics.Where(m => IsDeclared(declared, m.Name, m.DataType)).ToList();
+            if (sendable.Count < metrics.Count)
+            {
+                _logger.Warning("Dropped {Count} historical sample(s) for {Target}: their data type differs from the declared metric",
+                    metrics.Count - sendable.Count, deviceId ?? "the node");
+            }
+            if (sendable.Count == 0) return;
+
+            var sequence = NextSeq();
+            try
+            {
+                await PublishUnderLockAsync(DataTopic(deviceId), SparkplugMessageFactory.CreatePayload(sendable, sequence),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsConnectionLoss(ex))
+            {
+                BufferForBackfill(deviceId, sendable);
+                throw;
+            }
+
+            _logger.Debug("Published {Kind} for {Target} with {MetricCount} metrics, sequence {Sequence}",
+                deviceId is null ? "NDATA" : "DDATA", deviceId ?? "the node", sendable.Count, sequence);
+        }
+
+        /// <summary>
+        /// Keeps samples that could not be published live, when backfill is enabled. A full buffer drops
+        /// its oldest sample; that is logged once per outage.
+        /// </summary>
+        private void BufferForBackfill(string? deviceId, IEnumerable<Metric> metrics)
+        {
+            if (_backfill is null) return;
+
+            foreach (var metric in metrics)
+            {
+                if (_backfill.Add(deviceId, metric) && !_backfillOverflowLogged)
+                {
+                    _backfillOverflowLogged = true;
+                    _logger.Warning("Backfill buffer is full ({Capacity} samples): dropping the oldest samples until the connection is restored",
+                        _backfill.Capacity);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sends the buffered samples as history (is_historical, original timestamps), oldest first, in
+        /// messages of at most <see cref="BackfillMaxMetricsPerMessage"/> metrics. Runs at the end of a
+        /// birth sequence, so only metrics the births declared can be sent. A sample that is the value the
+        /// birth already carried as current is skipped. If the connection drops part way, the unsent
+        /// samples are kept for the next connection.
+        /// </summary>
+        private async Task PublishBackfillUnderLockAsync(CancellationToken cancellationToken)
+        {
+            if (_backfill is not { Count: > 0 }) return;
+
+            var samples = _backfill.TakeAll();
+            var done = new bool[samples.Count];
+            int published = 0, undeclared = 0, messages = 0;
+
+            try
+            {
+                foreach (var target in Enumerable.Range(0, samples.Count).GroupBy(i => samples[i].DeviceId))
+                {
+                    var deviceId = target.Key;
+                    var declared = deviceId is null ? _declaredNodeMetrics : _declaredDeviceMetrics.GetValueOrDefault(deviceId);
+
+                    var toSend = new List<int>();
+                    foreach (var i in target)
+                    {
+                        var sample = samples[i];
+                        if (declared is null || !IsDeclared(declared, sample.Name, sample.DataType))
+                        {
+                            undeclared++; // device retired, or metric or type changed during the outage
+                            done[i] = true;
+                        }
+                        else if (IsCurrentValue(deviceId, sample))
+                        {
+                            done[i] = true; // already in the birth, as current state
+                        }
+                        else
+                        {
+                            toSend.Add(i);
+                        }
+                    }
+
+                    foreach (var chunk in toSend.Chunk(BackfillMaxMetricsPerMessage))
+                    {
+                        var metrics = chunk.Select(i => samples[i].ToHistoricalMetric()).ToList();
+                        await PublishUnderLockAsync(DataTopic(deviceId), SparkplugMessageFactory.CreatePayload(metrics, NextSeq()),
+                            cancellationToken).ConfigureAwait(false);
+
+                        foreach (var i in chunk) done[i] = true;
+                        published += chunk.Length;
+                        messages++;
+                    }
+                }
+            }
+            catch
+            {
+                _backfill.Restore(Enumerable.Range(0, samples.Count).Where(i => !done[i]).Select(i => samples[i]));
+                throw;
+            }
+
+            _logger.Information(
+                "Backfilled {Published} samples in {Messages} messages ({Dropped} dropped while the buffer was full, {Undeclared} no longer declared)",
+                published, messages, _backfill.Dropped, undeclared);
+            _backfill.ResetDropped();
+            _backfillOverflowLogged = false;
+        }
+
+        private bool IsCurrentValue(string? deviceId, BufferedSample sample)
+        {
+            var current = deviceId is null
+                ? _metricStore.GetNodeMetric(sample.Name)
+                : _metricStore.GetDeviceMetric(deviceId, sample.Name);
+
+            return current != null && current.Timestamp == sample.Timestamp && Equals(current.Value, sample.Value);
+        }
+
+        private string DataTopic(string? deviceId) => deviceId is null
+            ? SparkplugTopics.GetNodeDataTopic(_config.GroupId, _config.EdgeNodeId)
+            : SparkplugTopics.GetDeviceDataTopic(_config.GroupId, _config.EdgeNodeId, deviceId);
 
         /// <summary>
         /// NDEATH with this connection's bdSeq, QoS 1 like the will, so the PUBACK confirms it arrived
@@ -717,8 +881,13 @@ namespace SparkplugB.Publisher
             return list;
         }
 
+        private static bool IsDeclared(Dictionary<string, MetricDataType> declared, string name, MetricDataType type) =>
+            declared.TryGetValue(name, out var declaredType) && declaredType == type;
+
         private static bool AllDeclared(Dictionary<string, MetricDataType> declared, List<Metric> metrics) =>
-            metrics.All(m => declared.TryGetValue(m.Name, out var type) && type == m.DataType);
+            metrics.All(m => IsDeclared(declared, m.Name, m.DataType));
+
+        private static bool IsConnectionLoss(Exception ex) => ex is MqttCommunicationException or ObjectDisposedException;
 
         private static string Undeclared(Dictionary<string, MetricDataType> declared, List<Metric> metrics) =>
             string.Join(", ", metrics

@@ -25,6 +25,9 @@ public static class SparkplugAssert
         {
             void Fail(string why) => errors.Add($"{m}  <-- {why}");
 
+            if (m.Kind is "NBIRTH" or "DBIRTH" && m.HistoricalMetrics.Count > 0)
+                Fail("a birth carries current state; no metric in it may be historical");
+
             switch (m.Kind)
             {
                 case "NCMD":

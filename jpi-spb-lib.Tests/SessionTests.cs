@@ -6,6 +6,7 @@ namespace SparkplugB.Publisher.Tests;
 /// Edge node session behaviour against a real (in-process) MQTT broker, as a Sparkplug host sees it.
 /// Every test finishes with <see cref="SparkplugAssert.SessionsAreWellFormed"/>.
 /// </summary>
+[Collection("Broker")]
 public class SessionTests
 {
     private static Metric M(string name, object? value, MetricDataType type = MetricDataType.Double) => new(name, value, type);

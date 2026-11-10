@@ -69,6 +69,20 @@
         public double ConnectTimeoutSeconds { get; set; } = 10;
 
         /// <summary>
+        /// Keep the samples published while there is no connection and send them as history
+        /// (is_historical, with their original timestamps) right after the next birth sequence. The births
+        /// carry each metric's latest value as current state. Off by default. The buffer is in memory, so
+        /// a restart during an outage loses it.
+        /// </summary>
+        public bool BackfillEnabled { get; set; } = false;
+
+        /// <summary>
+        /// The most samples kept for backfill (one sample is one metric value). When the buffer is full the
+        /// oldest samples are dropped, and a warning is logged once per outage.
+        /// </summary>
+        public int BackfillMaxSamples { get; set; } = 10000;
+
+        /// <summary>
         /// Validates the configuration
         /// </summary>
         public bool Validate(out string? errorMessage)
@@ -108,6 +122,12 @@
             if (ConnectTimeoutSeconds <= 0)
             {
                 errorMessage = "ConnectTimeoutSeconds must be positive";
+                return false;
+            }
+
+            if (BackfillEnabled && BackfillMaxSamples <= 0)
+            {
+                errorMessage = "BackfillMaxSamples must be positive when BackfillEnabled is set";
                 return false;
             }
 
