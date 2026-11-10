@@ -47,10 +47,21 @@
 
         /// <summary>
         /// File that records the bdSeq of the last MQTT connection, so the sequence continues across
-        /// restarts. A relative path is resolved against the application folder. Null or empty uses
-        /// "sparkplug_bdseq.txt" in the application folder.
+        /// restarts. A relative path is resolved against the application folder. Null or empty uses one
+        /// file per edge node, "&lt;GroupId&gt;.&lt;EdgeNodeId&gt;.bdseq", in the operating system's state folder:
+        /// %ProgramData%\JPI Solutions\Sparkplug on Windows; elsewhere $STATE_DIRECTORY (set by systemd's
+        /// StateDirectory=), else $XDG_STATE_HOME/jpi-sparkplug, else ~/.local/state/jpi-sparkplug.
         /// </summary>
         public string? BdSeqFilePath { get; set; }
+
+        /// <summary>
+        /// Group, edge node and device IDs and metric names must follow Ignition's naming rules (see
+        /// <see cref="SparkplugNames"/>). When true (the default), an invalid name is published under its
+        /// valid form, with '_' for each character not allowed, and a warning is logged once. When false,
+        /// an invalid metric or device is not published (an error is logged once), and an invalid
+        /// GroupId or EdgeNodeId is a configuration error.
+        /// </summary>
+        public bool RenameInvalidNames { get; set; } = true;
 
         /// <summary>
         /// Delay before retrying after a failed connection attempt. It doubles on each consecutive
@@ -98,6 +109,18 @@
             if (string.IsNullOrWhiteSpace(EdgeNodeId))
             {
                 errorMessage = "EdgeNodeId is required";
+                return false;
+            }
+
+            if (!RenameInvalidNames && !SparkplugNames.IsValidId(GroupId))
+            {
+                errorMessage = $"GroupId '{GroupId}' is not a valid Ignition name (and RenameInvalidNames is off)";
+                return false;
+            }
+
+            if (!RenameInvalidNames && !SparkplugNames.IsValidId(EdgeNodeId))
+            {
+                errorMessage = $"EdgeNodeId '{EdgeNodeId}' is not a valid Ignition name (and RenameInvalidNames is off)";
                 return false;
             }
 
