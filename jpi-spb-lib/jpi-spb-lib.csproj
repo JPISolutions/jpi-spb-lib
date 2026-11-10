@@ -9,19 +9,17 @@
     <PackageId>JPI.SparkplugB.Publisher</PackageId>
     <Authors>Dustin Symes</Authors>
     <Description>A .NET library for publishing MQTT Sparkplug-B messages</Description>
-    <PackageVersion>0.1.0</PackageVersion>
+    <Version>0.2.0</Version>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/JPISolutions/jpi-spb-lib</PackageProjectUrl>
-    <Copyright>Copyright (C) 2025 JPI Solutions</Copyright>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright (C) 2025-2026 JPI Solutions</Copyright>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Google.Protobuf" Version="3.31.1" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.6" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.6" />
     <PackageReference Include="MQTTnet" Version="4.3.7.1207" />
-    <PackageReference Include="MQTTnet.Extensions.ManagedClient" Version="4.3.7.1207" />
     <PackageReference Include="Serilog" Version="4.3.0" />
     <PackageReference Include="Grpc.Tools" Version="2.60.0">
       <PrivateAssets>all</PrivateAssets>
@@ -35,6 +33,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="jpi-spb-lib.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 
