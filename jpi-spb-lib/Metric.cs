@@ -31,6 +31,13 @@
         public Dictionary<string, string>? Properties { get; set; }
 
         /// <summary>
+        /// Marks a sample that is not the metric's current value: it was acquired earlier and is being
+        /// sent late (backfill, store and forward). Sent as is_historical, so a host records it in history
+        /// without updating the current value. It never replaces the publisher's stored current value.
+        /// </summary>
+        public bool IsHistorical { get; set; }
+
+        /// <summary>
         /// Creates a new metric with the current timestamp
         /// </summary>
         public Metric(string name, object? value, MetricDataType dataType)
@@ -49,6 +56,16 @@
             Value = value;
             Timestamp = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
+
+        /// <summary>
+        /// A copy, so a stored metric cannot be changed by the caller mutating the object it passed in.
+        /// </summary>
+        internal Metric Clone() => new(Name, Value, DataType)
+        {
+            Timestamp = Timestamp,
+            Properties = Properties is null ? null : new Dictionary<string, string>(Properties),
+            IsHistorical = IsHistorical
+        };
     }
 
     /// <summary>

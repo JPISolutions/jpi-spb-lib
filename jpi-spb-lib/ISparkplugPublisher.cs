@@ -13,12 +13,14 @@ namespace SparkplugB.Publisher
         bool IsConnected { get; }
 
         /// <summary>
-        /// Connects to the MQTT broker and publishes NBIRTH
+        /// Starts connecting to the MQTT broker; returns once the first attempt has finished. The publisher
+        /// keeps the connection up from then on (reconnecting with back-off) and publishes NBIRTH and every
+        /// DBIRTH on each new connection. An unreachable broker does not make this throw.
         /// </summary>
         Task ConnectAsync(CancellationToken cancellationToken = default);
 
         /// <summary>
-        /// Disconnects from the MQTT broker
+        /// Publishes NDEATH and disconnects from the MQTT broker
         /// </summary>
         Task DisconnectAsync(CancellationToken cancellationToken = default);
 

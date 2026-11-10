@@ -18,13 +18,49 @@ namespace SparkplugB.Publisher
         {
             if (metric == null) throw new ArgumentNullException(nameof(metric));
 
-            _nodeMetrics.AddOrUpdate(metric.Name,
-                metric,
-                (key, existing) =>
-                {
-                    existing.UpdateValue(metric.Value);
-                    return existing;
-                });
+            _nodeMetrics.AddOrUpdate(metric.Name, _ => AsCurrent(metric), (_, existing) => Merge(existing, metric));
+        }
+
+        /// <summary>
+        /// Replaces the node's metric set, as an NBIRTH declares it.
+        /// </summary>
+        public void ReplaceNodeMetrics(IEnumerable<Metric> metrics)
+        {
+            _nodeMetrics.Clear();
+            UpdateNodeMetrics(metrics);
+        }
+
+        /// <summary>
+        /// Takes the incoming value and timestamp. A change of data type replaces the stored metric, since
+        /// the type is part of what the birth certificate declares. A historical sample is not current
+        /// state, so it leaves the stored value alone.
+        /// </summary>
+        private static Metric Merge(Metric existing, Metric incoming)
+        {
+            if (incoming.IsHistorical)
+            {
+                return existing;
+            }
+
+            if (existing.DataType != incoming.DataType)
+            {
+                return AsCurrent(incoming);
+            }
+
+            existing.Value = incoming.Value;
+            existing.Timestamp = incoming.Timestamp;
+            return existing;
+        }
+
+        /// <summary>
+        /// A stored copy. The store holds current state, which a birth certificate carries, so the copy is
+        /// never flagged historical, even when a historical sample is the first value seen for a metric.
+        /// </summary>
+        private static Metric AsCurrent(Metric metric)
+        {
+            var copy = metric.Clone();
+            copy.IsHistorical = false;
+            return copy;
         }
 
         /// <summary>
@@ -50,13 +86,19 @@ namespace SparkplugB.Publisher
 
             var deviceDict = _deviceMetrics.GetOrAdd(deviceId, _ => new ConcurrentDictionary<string, Metric>());
 
-            deviceDict.AddOrUpdate(metric.Name,
-                metric,
-                (key, existing) =>
-                {
-                    existing.UpdateValue(metric.Value);
-                    return existing;
-                });
+            deviceDict.AddOrUpdate(metric.Name, _ => AsCurrent(metric), (_, existing) => Merge(existing, metric));
+        }
+
+        /// <summary>
+        /// Replaces a device's metric set, as a DBIRTH declares it.
+        /// </summary>
+        public void ReplaceDeviceMetrics(string deviceId, IEnumerable<Metric> metrics)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId))
+                throw new ArgumentException("Device ID cannot be null or empty", nameof(deviceId));
+
+            _deviceMetrics[deviceId] = new ConcurrentDictionary<string, Metric>();
+            UpdateDeviceMetrics(deviceId, metrics);
         }
 
         /// <summary>
