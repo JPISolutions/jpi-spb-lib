@@ -50,8 +50,14 @@ namespace SparkplugB.Publisher
         private readonly SparkplugConfiguration _config;
         private readonly IMqttClient _client;
         private readonly MetricStore _metricStore = new();
-        private readonly BdSeqManager _bdSeqManager;
+        private readonly NameResolver _names;
         private ILogger _logger;
+
+        // Group and edge node IDs as published (renamed when invalid), and the bdSeq state for that edge
+        // node. Resolved by ConnectAsync, since a caller may set the IDs after constructing the publisher.
+        private string _groupId;
+        private string _edgeNodeId;
+        private BdSeqManager? _bdSeqManager;
 
         // Serialises sequence-number allocation, publishing, and the session state below.
         private readonly SemaphoreSlim _publishLock = new(1, 1);
@@ -90,10 +96,9 @@ namespace SparkplugB.Publisher
             }
 
             _logger = Log.Logger; // Default to global logger
-            _bdSeqManager = new BdSeqManager(_config.BdSeqFilePath);
-            _lastBdSeq = _bdSeqManager.LoadLast();
-            _logger.Information("bdSeq state {Path}: last connection used {BdSeq}",
-                _bdSeqManager.FilePath, _lastBdSeq?.ToString() ?? "none");
+            _names = new NameResolver(_config.RenameInvalidNames, () => _logger);
+            _groupId = SparkplugNames.MakeValidId(_config.GroupId);
+            _edgeNodeId = SparkplugNames.MakeValidId(_config.EdgeNodeId);
 
             if (_config.BackfillEnabled)
             {
@@ -122,6 +127,10 @@ namespace SparkplugB.Publisher
         /// whenever a connection is made, so an unreachable broker does not make this throw. Calling it
         /// again while the publisher is running has no effect.
         /// </summary>
+        /// <exception cref="ArgumentException">
+        /// The configuration is invalid, for example an EdgeNodeId set after construction that is not a
+        /// valid Ignition name while RenameInvalidNames is off.
+        /// </exception>
         public Task ConnectAsync(CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
@@ -131,6 +140,25 @@ namespace SparkplugB.Publisher
             {
                 if (_supervisor is null)
                 {
+                    // Checked again here: a caller may have changed the configuration since construction.
+                    if (!_config.Validate(out var error))
+                    {
+                        throw new ArgumentException($"Invalid configuration: {error}");
+                    }
+
+                    _groupId = ResolveConfiguredId(nameof(_config.GroupId), _config.GroupId);
+                    _edgeNodeId = ResolveConfiguredId(nameof(_config.EdgeNodeId), _config.EdgeNodeId);
+
+                    _bdSeqManager = new BdSeqManager(_config.BdSeqFilePath, _groupId, _edgeNodeId);
+                    _lastBdSeq = _bdSeqManager.LoadLast(out var problem);
+                    if (problem != null)
+                    {
+                        _logger.Warning("Could not read the bdSeq state file {Path}: {Problem}; the bdSeq sequence starts again at 0",
+                            _bdSeqManager.FilePath, problem);
+                    }
+                    _logger.Information("bdSeq state {Path}: last connection used {BdSeq}",
+                        _bdSeqManager.FilePath, _lastBdSeq?.ToString() ?? "none");
+
                     _stopping = false;
                     _supervisorCts = new CancellationTokenSource();
                     _firstAttempt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -264,7 +292,11 @@ namespace SparkplugB.Publisher
             // connection uses up a bdSeq: failed attempts would otherwise leave gaps in the sequence.
             _lastBdSeq = bdSeq;
             _bdSeq = bdSeq;
-            _bdSeqManager.Save(bdSeq);
+            if (!_bdSeqManager!.TrySave(bdSeq, out var problem))
+            {
+                _logger.Warning("Could not save the bdSeq state file {Path}: {Problem}; after a restart the bdSeq sequence may repeat",
+                    _bdSeqManager.FilePath, problem);
+            }
             _logger.Information("Connected to MQTT broker {Broker}:{Port} with bdSeq {BdSeq}",
                 _config.MqttBroker, _config.MqttPort, bdSeq);
 
@@ -279,7 +311,7 @@ namespace SparkplugB.Publisher
                 // Subscribe before the NBIRTH, so a rebirth request is never missed.
                 await _client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder()
                     .WithTopicFilter(f => f
-                        .WithTopic(SparkplugTopics.GetNodeCommandTopic(_config.GroupId, _config.EdgeNodeId))
+                        .WithTopic(SparkplugTopics.GetNodeCommandTopic(_groupId, _edgeNodeId))
                         .WithAtLeastOnceQoS()) // tck-id-message-flow-edge-node-ncmd-subscribe
                     .Build(), cancellationToken).ConfigureAwait(false);
 
@@ -310,14 +342,14 @@ namespace SparkplugB.Publisher
         private MqttClientOptions BuildClientOptions(ulong bdSeq)
         {
             var builder = new MqttClientOptionsBuilder()
-                .WithClientId($"{_config.GroupId}.{_config.EdgeNodeId}")
+                .WithClientId($"{_groupId}.{_edgeNodeId}")
                 .WithTcpServer(_config.MqttBroker, _config.MqttPort)
                 .WithKeepAlivePeriod(TimeSpan.FromSeconds(_config.KeepAliveSeconds))
                 .WithTimeout(TimeSpan.FromSeconds(_config.ConnectTimeoutSeconds))
                 .WithCleanSession(true)
                 // The will is this connection's NDEATH, published by the broker if the connection drops
                 // without a clean DISCONNECT. QoS 1, not retained (tck-id-payloads-ndeath-will-message-qos / -retain).
-                .WithWillTopic(SparkplugTopics.GetNodeDeathTopic(_config.GroupId, _config.EdgeNodeId))
+                .WithWillTopic(SparkplugTopics.GetNodeDeathTopic(_groupId, _edgeNodeId))
                 .WithWillPayload(SparkplugMessageFactory.CreateNodeDeath(bdSeq))
                 .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                 .WithWillRetain(false);
@@ -360,9 +392,11 @@ namespace SparkplugB.Publisher
         // Publishing
         // ================================================================================================
 
-        public async Task PublishNodeMetricsAsync(IEnumerable<Metric> metrics, CancellationToken cancellationToken = default)
+        public Task PublishNodeMetricsAsync(IEnumerable<Metric> metrics, CancellationToken cancellationToken = default) =>
+            PublishNodeDataAsync(ToValidatedList(_names.ResolveMetrics(null, metrics)), cancellationToken);
+
+        private async Task PublishNodeDataAsync(List<Metric> list, CancellationToken cancellationToken)
         {
-            var list = ToValidatedList(metrics);
             if (list.Count == 0) return;
 
             await RunUnderLockAsync(async () =>
@@ -395,7 +429,7 @@ namespace SparkplugB.Publisher
         /// </summary>
         public async Task PublishNodeBirthAsync(IEnumerable<Metric> metrics, CancellationToken cancellationToken)
         {
-            var list = ToValidatedList(metrics);
+            var list = ToValidatedList(_names.ResolveMetrics(null, metrics));
 
             await RunUnderLockAsync(async () =>
             {
@@ -417,26 +451,32 @@ namespace SparkplugB.Publisher
         public async Task PublishDeviceBirthAsync(string deviceId, IEnumerable<Metric> metrics, CancellationToken cancellationToken = default)
         {
             ValidateDeviceId(deviceId);
-            var list = ToValidatedList(metrics);
+            if (_names.ResolveDeviceId(deviceId) is not { } device) return;
+            var list = ToValidatedList(_names.ResolveMetrics(device, metrics));
 
             await RunUnderLockAsync(async () =>
             {
-                _metricStore.ReplaceDeviceMetrics(deviceId, list);
+                _metricStore.ReplaceDeviceMetrics(device, list);
                 if (SessionIsLive)
                 {
-                    await PublishDeviceBirthUnderLockAsync(deviceId, cancellationToken).ConfigureAwait(false);
+                    await PublishDeviceBirthUnderLockAsync(device, cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
-                    BufferForBackfill(deviceId, list);
+                    BufferForBackfill(device, list);
                 }
             }, cancellationToken).ConfigureAwait(false);
         }
 
-        public async Task PublishDeviceMetricsAsync(string deviceId, IEnumerable<Metric> metrics, CancellationToken cancellationToken = default)
+        public Task PublishDeviceMetricsAsync(string deviceId, IEnumerable<Metric> metrics, CancellationToken cancellationToken = default)
         {
             ValidateDeviceId(deviceId);
-            var list = ToValidatedList(metrics);
+            if (_names.ResolveDeviceId(deviceId) is not { } device) return Task.CompletedTask;
+            return PublishDeviceDataAsync(device, ToValidatedList(_names.ResolveMetrics(device, metrics)), cancellationToken);
+        }
+
+        private async Task PublishDeviceDataAsync(string deviceId, List<Metric> list, CancellationToken cancellationToken)
+        {
             if (list.Count == 0) return;
 
             await RunUnderLockAsync(async () =>
@@ -476,6 +516,8 @@ namespace SparkplugB.Publisher
         public async Task PublishDeviceDeathAsync(string deviceId, CancellationToken cancellationToken = default)
         {
             ValidateDeviceId(deviceId);
+            if (_names.ResolveDeviceId(deviceId) is not { } device) return;
+            deviceId = device;
 
             await RunUnderLockAsync(async () =>
             {
@@ -486,7 +528,7 @@ namespace SparkplugB.Publisher
                 if (!wasBirthed || !SessionIsLive) return;
 
                 var sequence = NextSeq();
-                await PublishUnderLockAsync(SparkplugTopics.GetDeviceDeathTopic(_config.GroupId, _config.EdgeNodeId, deviceId),
+                await PublishUnderLockAsync(SparkplugTopics.GetDeviceDeathTopic(_groupId, _edgeNodeId, deviceId),
                     SparkplugMessageFactory.CreateDeviceDeath(sequence), cancellationToken).ConfigureAwait(false);
                 _logger.Information("Published DDEATH for device {DeviceId}, sequence {Sequence}", deviceId, sequence);
             }, cancellationToken).ConfigureAwait(false);
@@ -497,21 +539,14 @@ namespace SparkplugB.Publisher
         /// </summary>
         public async Task PublishChangedMetricsAsync(CancellationToken cancellationToken = default)
         {
+            // Stored metrics already carry their published names, so they skip name resolution.
             var (nodeMetrics, deviceMetrics) = _metricStore.GetChangedMetrics();
 
-            var changedNode = nodeMetrics.ToList();
-            if (changedNode.Count > 0)
-            {
-                await PublishNodeMetricsAsync(changedNode, cancellationToken).ConfigureAwait(false);
-            }
+            await PublishNodeDataAsync(ToValidatedList(nodeMetrics), cancellationToken).ConfigureAwait(false);
 
             foreach (var kvp in deviceMetrics)
             {
-                var changed = kvp.Value.ToList();
-                if (changed.Count > 0)
-                {
-                    await PublishDeviceMetricsAsync(kvp.Key, changed, cancellationToken).ConfigureAwait(false);
-                }
+                await PublishDeviceDataAsync(kvp.Key, ToValidatedList(kvp.Value), cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -536,19 +571,19 @@ namespace SparkplugB.Publisher
         }
 
         /// <summary>
-        /// Gets the current value of a node metric
+        /// Gets the current value of a node metric, by the name it was published with or under
         /// </summary>
         public Metric? GetNodeMetric(string metricName)
         {
-            return _metricStore.GetNodeMetric(metricName);
+            return _metricStore.GetNodeMetric(PublishedMetricName(metricName));
         }
 
         /// <summary>
-        /// Gets the current value of a device metric
+        /// Gets the current value of a device metric, by the names it was published with or under
         /// </summary>
         public Metric? GetDeviceMetric(string deviceId, string metricName)
         {
-            return _metricStore.GetDeviceMetric(deviceId, metricName);
+            return _metricStore.GetDeviceMetric(PublishedDeviceId(deviceId), PublishedMetricName(metricName));
         }
 
         /// <summary>
@@ -564,7 +599,26 @@ namespace SparkplugB.Publisher
         /// </summary>
         public IEnumerable<Metric> GetAllDeviceMetrics(string deviceId)
         {
-            return _metricStore.GetDeviceMetrics(deviceId);
+            return _metricStore.GetDeviceMetrics(PublishedDeviceId(deviceId));
+        }
+
+        private string PublishedDeviceId(string deviceId) =>
+            _config.RenameInvalidNames ? SparkplugNames.MakeValidId(deviceId) : deviceId;
+
+        private string PublishedMetricName(string metricName) =>
+            _config.RenameInvalidNames ? SparkplugNames.MakeValidMetricName(metricName) : metricName;
+
+        /// <summary>
+        /// The group or edge node ID to publish under. Configuration validation has already rejected an
+        /// invalid ID when renaming is off, so here it can only be renamed.
+        /// </summary>
+        private string ResolveConfiguredId(string setting, string value)
+        {
+            if (SparkplugNames.IsValidId(value)) return value;
+
+            var valid = SparkplugNames.MakeValidId(value);
+            _logger.Warning("{Setting} '{Value}' is not a valid Ignition name; publishing as '{Published}'", setting, value, valid);
+            return valid;
         }
 
         // ================================================================================================
@@ -612,7 +666,7 @@ namespace SparkplugB.Publisher
             _seq = 0;
 
             var nodeMetrics = _metricStore.GetNodeMetrics().ToList();
-            await PublishUnderLockAsync(SparkplugTopics.GetNodeBirthTopic(_config.GroupId, _config.EdgeNodeId),
+            await PublishUnderLockAsync(SparkplugTopics.GetNodeBirthTopic(_groupId, _edgeNodeId),
                 SparkplugMessageFactory.CreateNodeBirth(nodeMetrics, _bdSeq, NextSeq()), cancellationToken).ConfigureAwait(false);
             foreach (var metric in nodeMetrics)
             {
@@ -635,7 +689,7 @@ namespace SparkplugB.Publisher
         {
             var metrics = _metricStore.GetDeviceMetrics(deviceId).ToList();
             var sequence = NextSeq();
-            await PublishUnderLockAsync(SparkplugTopics.GetDeviceBirthTopic(_config.GroupId, _config.EdgeNodeId, deviceId),
+            await PublishUnderLockAsync(SparkplugTopics.GetDeviceBirthTopic(_groupId, _edgeNodeId, deviceId),
                 SparkplugMessageFactory.CreatePayload(metrics, sequence), cancellationToken).ConfigureAwait(false);
 
             _declaredDeviceMetrics[deviceId] = metrics.ToDictionary(m => m.Name, m => m.DataType);
@@ -771,8 +825,8 @@ namespace SparkplugB.Publisher
         }
 
         private string DataTopic(string? deviceId) => deviceId is null
-            ? SparkplugTopics.GetNodeDataTopic(_config.GroupId, _config.EdgeNodeId)
-            : SparkplugTopics.GetDeviceDataTopic(_config.GroupId, _config.EdgeNodeId, deviceId);
+            ? SparkplugTopics.GetNodeDataTopic(_groupId, _edgeNodeId)
+            : SparkplugTopics.GetDeviceDataTopic(_groupId, _edgeNodeId, deviceId);
 
         /// <summary>
         /// NDEATH with this connection's bdSeq, QoS 1 like the will, so the PUBACK confirms it arrived
@@ -787,7 +841,7 @@ namespace SparkplugB.Publisher
             try
             {
                 var message = new MqttApplicationMessageBuilder()
-                    .WithTopic(SparkplugTopics.GetNodeDeathTopic(_config.GroupId, _config.EdgeNodeId))
+                    .WithTopic(SparkplugTopics.GetNodeDeathTopic(_groupId, _edgeNodeId))
                     .WithPayload(SparkplugMessageFactory.CreateNodeDeath(_bdSeq))
                     .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
                     .WithRetainFlag(false)
@@ -832,7 +886,7 @@ namespace SparkplugB.Publisher
 
         private Task OnMessageReceivedAsync(MqttApplicationMessageReceivedEventArgs e)
         {
-            if (e.ApplicationMessage.Topic != SparkplugTopics.GetNodeCommandTopic(_config.GroupId, _config.EdgeNodeId))
+            if (e.ApplicationMessage.Topic != SparkplugTopics.GetNodeCommandTopic(_groupId, _edgeNodeId))
             {
                 return Task.CompletedTask;
             }
